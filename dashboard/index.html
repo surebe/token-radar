@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>Token Launch Radar</h1>
+    <p class="sub">Every protocol in the sealed snapshot, classified. Those that record no token — and are not a wrapped, staked or exchange product of one that trades — ranked by what their launch would be worth. The value model and the launch odds are both fitted on the snapshot itself by the program that built this page; the farm verdicts are arithmetic under assumptions printed below, not promises.</p>
+  </div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<section class="strip" id="selfcheck" aria-label="Self check"></section>
+<section class="acct" id="accounting" aria-label="Accounting"></section>
+
+<nav class="views" aria-label="Views">
+  <button type="button" data-view="board" class="on">The board</button>
+  <button type="button" data-view="model">The model &amp; its validation</button>
+  <button type="button" data-view="live">Already launched</button>
+</nav>
+
+<main>
+  <section id="view-board">
+    <div class="controls">
+      <label>Search <input id="q" type="search" placeholder="name or slug"></label>
+      <label>Category <select id="cat"><option value="">All categories</option></select></label>
+      <label>Verdict
+        <select id="verdict">
+          <option value="">Any verdict</option><option>FARM</option><option>MARGINAL</option><option>SKIP</option>
+        </select>
+      </label>
+      <label>Implied tier
+        <select id="tier">
+          <option value="">Any size</option>
+          <option value="10m">Implied ≥ $10M</option>
+          <option value="1m">Implied $1M – $10M</option>
+          <option value="100k">Implied $100K – $1M</option>
+          <option value="small">Implied &lt; $100K</option>
+        </select>
+      </label>
+      <label class="chk"><input id="wl" type="checkbox"> Watchlist only</label>
+      <label>Sort
+        <select id="sort">
+          <option value="rank">Implied value (rank)</option>
+          <option value="perhour">Net $/hour</option>
+          <option value="tvl">TVL</option>
+          <option value="odds">Launch odds</option>
+          <option value="age">Age</option>
+          <option value="name">Name</option>
+        </select>
+      </label>
+      <label>Your capital $ <input id="cap" type="number" min="0" step="100" placeholder="archetype minimums"></label>
+      <label>Drop share % <input id="drop" type="number" min="0" max="100" step="1"></label>
+      <label>Season weeks <input id="weeks" type="number" min="1" max="52" step="1"></label>
+    </div>
+    <p class="count" id="rowcount"></p>
+    <div class="tablewrap">
+      <table id="board">
+        <thead><tr>
+          <th class="r">#</th><th>Protocol</th><th>Category</th><th class="r">TVL</th><th class="r">7d</th>
+          <th class="r">Age</th><th class="r">Value if launched</th><th class="r">Odds</th><th class="r">Implied</th>
+          <th>Verdict</th><th class="r">Net $/h</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint">Select a row for the protocol's detail: the model's working, the economics at your inputs, and its farm plan. Verdicts and $/hour recompute live when you change capital, drop share or season length; the printed plan in each detail view is the canonical one at the archetype's minimum capital.</p>
+  </section>
+
+  <section id="view-detail" hidden></section>
+
+  <section id="view-model" hidden>
+    <h2>How a row gets its number</h2>
+    <p>Three steps, all fitted by the program on the snapshot itself — no hand-kept list, no carried-in coefficients. <strong>Conditional value</strong>: what the token would be worth if it launched. <strong>Launch odds</strong>: how likely a launch is, read off the population. <strong>Implied value</strong> = conditional value × launch odds, the ranking.</p>
+    <div class="formula" id="formula-value"></div>
+    <p>The slope is the finding. A flat TVL × multiple rule assumes value grows in proportion to TVL (slope 1); the traded population says 0.52. At $10M of TVL the two rules roughly agree; at $1B the flat rule prices a launch about five times higher than the fitted line, and at $10B about fifteen times. The giants are exactly where a radar earns its keep, and exactly where the flat rule is most wrong. Averages are worse than either: the mean recorded multiple is poisoned by outliers (one protocol trades near 400× its TVL), so every "typical" figure here is a median or a geometric fit.</p>
+    <h3>Validation, measured out-of-sample by the same run</h3>
+    <div class="tablewrap"><table id="valtable">
+      <thead><tr><th>Test</th><th class="r">This model</th><th class="r">Flat multiple</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p class="fine" id="valnote"></p>
+    <h3>Launch odds</h3>
+    <div class="formula" id="formula-odds"></div>
+    <p class="fine">Read the odds as prevalence, not prophecy: the fit learns how often protocols with these figures already record a token, which mixes "will launch" with "already did". Brier scores punish confident wrongness; lower is better, and the base-rate row is the score for guessing the population average for everyone.</p>
+    <p class="fine" id="oddsnote"></p>
+    <h3>Range honesty</h3>
+    <p class="fine" id="rangenote"></p>
+    <p>Fancier variants were fitted and rejected on the evidence: adding growth, age or category terms to the value fit, and a saturating (logistic-in-TVL) form, each win on some time splits and lose on others, so none earns its complexity. The simple sub-linear line is the model because it is the one that holds up out-of-sample.</p>
+    <h3>Farm economics</h3>
+    <p>Each category farms by an archetype — the action, a season's transaction count, setup and upkeep minutes, a sensible minimum capital. A row's verdict is its plan's net dollars per hour of farmer time:</p>
+    <div class="formula">pool = conditional value × drop share &nbsp;·&nbsp; intensity = pool ÷ TVL &nbsp;·&nbsp; net $/h = (intensity × capital − gas − 5%/yr × capital × weeks/52) ÷ hours</div>
+    <p class="fine">Assumptions, stated once and used everywhere: drop share 10% of launch value reaches farmers; season 16 weeks; opportunity cost 5%/yr on locked capital; gas per transaction priced on the cheapest chain the protocol runs on — Ethereum $8, major L2s $0.15, Solana $0.02, anything else $0.50. Verdicts: FARM at $25/h or better, MARGINAL $5–25/h, SKIP below that or where no retail path exists. One consequence worth knowing: when a row's intensity is under the season's opportunity-cost floor (about 1.54% at 16 weeks), no position size breaks even — the drop share itself would have to be larger. Each detail view prints its row's break-even capital, or says there is none.</p>
+    <h3>What the data cannot say</h3>
+    <p class="fine">"Records no token" is the snapshot's wording made precise: both its token fields (CoinGecko id and symbol) are empty. A protocol can carry one field without the other — 258 do — so a one-field rule misreads the population in both directions. Listing dates are missing for 113 protocols, two of them on the watchlist; their ages are imputed at the population median and flagged on their rows. The value fit learns from the 128 traded tokens that record a market cap; the other 272 launched protocols record none, so the fit describes protocols that report a cap, not all that trade. Seven-day growth is winsorized to [−50%, +100%] because the raw field runs to +4,448%.</p>
+  </section>
+
+  <section id="view-live" hidden>
+    <h2>Already launched — set aside, not ranked</h2>
+    <p>These protocols already record a token, so they are not launch candidates. They are shown for accounting: the value fit above is learned from the 128 of them that record a market cap. The largest by market cap:</p>
+    <div class="tablewrap"><table id="livetable">
+      <thead><tr><th>Protocol</th><th>Category</th><th class="r">TVL</th><th class="r">Market cap</th><th class="r">7d</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+</main>
+
+<footer>
+  <p>Method in one line: implied value = fitted conditional value × fitted launch odds, both fitted on this snapshot at build time; exclusions are the snapshot's own watchlist rule without its $50M floor. Verdicts are arithmetic under the stated assumptions, not predictions, and nothing here is financial advice.</p>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
