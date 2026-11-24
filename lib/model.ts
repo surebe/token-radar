@@ -18,6 +18,8 @@
 // for the odds) and the numbers are handed to the dashboard, so the page
 // publishes the model's own measured miss next to its claims.
 
+import { createHash } from 'node:crypto';
+
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
@@ -212,9 +214,11 @@ export interface ValueFit {
   band_factor: number;
   /** Leave-one-out residual quantiles in dex, the honest spread of the fit. */
   resid_q05: number;
+  resid_q10: number;
   resid_q25: number;
   resid_q50: number;
   resid_q75: number;
+  resid_q90: number;
   resid_q95: number;
   baseline_k: number;
   baseline_in_sample: number;
@@ -278,9 +282,11 @@ export function fitValueModel(protocols: SnapshotProtocol[], asOf: string): Valu
     loo_within3: loo.within3,
     band_factor: Math.pow(10, loo.med),
     resid_q05: quantile(0.05),
+    resid_q10: quantile(0.1),
     resid_q25: quantile(0.25),
     resid_q50: quantile(0.5),
     resid_q75: quantile(0.75),
+    resid_q90: quantile(0.9),
     resid_q95: quantile(0.95),
     baseline_k: medianMultiple(rows),
     baseline_in_sample: logErrors(rows.map((p) => Math.log10(p.tvl_usd * medianMultiple(rows))), y).med,
@@ -290,7 +296,132 @@ export function fitValueModel(protocols: SnapshotProtocol[], asOf: string): Valu
   };
 }
 
-// -------------------------------------------------------------- the odds fit
+// ------------------------------------------------- ladders and range honesty
+
+/** A feature builder for the value ladder: a row in, its regressors out. */
+type ValueFeatures = (p: SnapshotProtocol) => number[];
+
+/** A value predictor fitted on training rows: a row in, its predicted log10 cap out. */
+type ValuePredictor = (train: SnapshotProtocol[]) => (p: SnapshotProtocol) => number;
+
+/** The dated walk-forward split of the value fit sample: oldest 60% train, newest 40% test. */
+function walkForwardSplit(rows: SnapshotProtocol[], asOf: string): { train: SnapshotProtocol[]; test: SnapshotProtocol[] } {
+  const ageOf = (p: SnapshotProtocol) => ageDaysApprox(asOf, p.listed_at);
+  const dated = rows.filter((p) => ageOf(p) !== null).sort((a, b) => ageOf(b)! - ageOf(a)!);
+  const cut = Math.floor(dated.length * 0.6);
+  return { train: dated.slice(0, cut), test: dated.slice(cut) };
+}
+
+/** One predictor measured both ways the page tests a model: leave-one-out and walk-forward. */
+function valueErrors(fit: ValuePredictor, rows: SnapshotProtocol[], asOf: string): { loo: number; wf: number } {
+  const y = rows.map((p) => Math.log10(p.mcap_usd!));
+  const looPred = rows.map((p, i) => fit(rows.filter((_, j) => j !== i))(p));
+  const { train, test } = walkForwardSplit(rows, asOf);
+  const wfPred = test.map((p) => fit(train)(p));
+  return { loo: logErrors(looPred, y).med, wf: logErrors(wfPred, test.map((p) => Math.log10(p.mcap_usd!))).med };
+}
+
+/** One rung of a term ladder: the term, its two held-out errors, and whether it survived both. */
+export interface LadderStep {
+  label: string;
+  /** The first test's error (leave-one-out for value, ten-fold Brier for odds). */
+  test_a: number;
+  /** The second test's error (walk-forward). */
+  test_b: number;
+  /** For odds rungs: the share of held-out protocols the rung calls right, first test. */
+  acc_a?: number;
+  /** For odds rungs: the share called right on the walk-forward test. */
+  acc_b?: number;
+  kept: boolean | null;
+}
+
+/**
+ * The value ladder: terms added in order to the last model that survived,
+ * a term kept only when it lowers the miss on BOTH held-out tests. On this
+ * snapshot only the size curve survives, which is why the board's value
+ * model is the size curve alone; the failed tests are published, not used.
+ */
+export function valueLadder(protocols: SnapshotProtocol[], asOf: string): LadderStep[] {
+  const rows = valueFitRows(protocols);
+  const cats = bigCategories(rows);
+  const flat: ValuePredictor = (train) => (p) => Math.log10(p.tvl_usd * medianMultiple(train));
+  const olsOn = (feats: ValueFeatures): ValuePredictor => (train) => {
+    const beta = ols(train.map(feats), train.map((p) => Math.log10(p.mcap_usd!)));
+    return (p) => dot(beta, feats(p));
+  };
+  const sizeFeats: ValueFeatures = (p) => [1, Math.log10(p.tvl_usd)];
+  const steps: LadderStep[] = [];
+  const base = valueErrors(flat, rows, asOf);
+  steps.push({ label: 'flat median multiple', test_a: base.loo, test_b: base.wf, kept: null });
+  let keptFeats: ValueFeatures = sizeFeats;
+  let keptErr = valueErrors(olsOn(sizeFeats), rows, asOf);
+  steps.push({ label: '+ size curve, log TVL', test_a: keptErr.loo, test_b: keptErr.wf, kept: keptErr.loo < base.loo && keptErr.wf < base.wf });
+  const candidates: { label: string; extra: ValueFeatures }[] = [
+    { label: '+ category effect', extra: (p) => cats.slice(1).map((c) => (p.category === c ? 1 : 0)) },
+    { label: '+ 7-day growth', extra: (p) => [growthFraction(p.change_7d)] },
+  ];
+  for (const cand of candidates) {
+    // Each candidate is tested as an addition to the model that survived so far.
+    const feats: ValueFeatures = (p) => [...keptFeats(p), ...cand.extra(p)];
+    const err = valueErrors(olsOn(feats), rows, asOf);
+    const kept = err.loo < keptErr.loo && err.wf < keptErr.wf;
+    steps.push({ label: cand.label, test_a: err.loo, test_b: err.wf, kept });
+    if (kept) {
+      keptFeats = feats;
+      keptErr = err;
+    }
+  }
+  return steps;
+}
+
+/** How honest the printed ranges are, measured on caps the fit did not use. */
+export interface RangeHonesty {
+  within3: number;
+  in_p25_75: number;
+  in_p10_90: number;
+}
+
+/**
+ * Range honesty for the value fit, both ways: leave-one-out (each cap priced
+ * by a fit that never saw it, ranges from the leave-one-out residuals) and
+ * walk-forward (the oldest-listed fit prices the newest, ranges from the
+ * training residuals). The printed per-row ranges use the leave-one-out
+ * residual quantiles, so the first column is the claim's own audit.
+ */
+export function rangeHonesty(protocols: SnapshotProtocol[], asOf: string): { loo: RangeHonesty; wf: RangeHonesty } {
+  const rows = valueFitRows(protocols);
+  const y = rows.map((p) => Math.log10(p.mcap_usd!));
+  const feats = (p: SnapshotProtocol) => [1, Math.log10(p.tvl_usd)];
+  const looPred: number[] = [];
+  const looResid: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const train = rows.filter((_, j) => j !== i);
+    const b = ols(train.map(feats), train.map((p) => Math.log10(p.mcap_usd!)));
+    looPred.push(dot(b, feats(rows[i]!)));
+    looResid.push(y[i]! - looPred[i]!);
+  }
+  const sorted = [...looResid].sort((a, b) => a - b);
+  const q = (qv: number) => sorted[Math.min(sorted.length - 1, Math.floor(qv * sorted.length))]!;
+  const cover = (preds: number[], actual: number[], lo: number, hi: number) =>
+    preds.filter((pr, i) => pr + lo <= actual[i]! && actual[i]! <= pr + hi).length / preds.length;
+  const loo: RangeHonesty = {
+    within3: looResid.filter((e) => Math.abs(e) <= Math.log10(3)).length / looResid.length,
+    in_p25_75: cover(looPred, y, q(0.25), q(0.75)),
+    in_p10_90: cover(looPred, y, q(0.1), q(0.9)),
+  };
+  const { train, test } = walkForwardSplit(rows, asOf);
+  const bTrain = ols(train.map(feats), train.map((p) => Math.log10(p.mcap_usd!)));
+  const trainResid = train.map((p) => Math.log10(p.mcap_usd!) - dot(bTrain, feats(p))).sort((a, b) => a - b);
+  const tq = (qv: number) => trainResid[Math.min(trainResid.length - 1, Math.floor(qv * trainResid.length))]!;
+  const testPred = test.map((p) => dot(bTrain, feats(p)));
+  const testY = test.map((p) => Math.log10(p.mcap_usd!));
+  const wf: RangeHonesty = {
+    within3: testY.filter((v, i) => Math.abs(v - testPred[i]!) <= Math.log10(3)).length / testY.length,
+    in_p25_75: cover(testPred, testY, tq(0.25), tq(0.75)),
+    in_p10_90: cover(testPred, testY, tq(0.1), tq(0.9)),
+  };
+  return { loo, wf };
+}
 
 /** Categories with at least five rows in the value-fit sample, first-appearance order; the first is the baseline. */
 export function bigCategories(fitRows: SnapshotProtocol[]): string[] {
@@ -345,7 +476,7 @@ export interface OddsFit {
   cats_big: string[];
   med_age_days: number;
   brier_in_sample: number;
-  /** Five stride folds over the snapshot's own order: deterministic, no seed to argue about. */
+  /** Ten stride folds over the snapshot's own order: deterministic, no seed to argue about. */
   brier_cv: number;
   brier_base_rate: number;
   base_rate: number;
@@ -362,9 +493,9 @@ export function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): OddsF
   const all = protocols.map((_, i) => i);
   const brier_in_sample = brier(all, beta);
   let cv = 0;
-  for (let f = 0; f < 5; f++) {
-    const test = all.filter((i) => i % 5 === f);
-    const train = all.filter((i) => i % 5 !== f);
+  for (let f = 0; f < 10; f++) {
+    const test = all.filter((i) => i % 10 === f);
+    const train = all.filter((i) => i % 10 !== f);
     const b = fitLogistic(
       train.map((i) => X[i]!),
       train.map((i) => y[i]!),
@@ -379,6 +510,80 @@ export function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): OddsF
 /** A protocol's launch odds under a fitted model. */
 export function launchOdds(fit: OddsFit, p: SnapshotProtocol, asOf: string): number {
   return sigmoid(dot(fit.beta, oddsFeatures(p, asOf, fit.cats_big, fit.med_age_days)));
+}
+
+/**
+ * The odds ladder: terms added in order — age, size, growth, category — each
+ * rung scored by ten-fold cross-validation over the whole snapshot and by
+ * walk-forward (fit on the oldest-listed 60% of dated protocols, scored on
+ * the newest 40%). A rung is marked kept when adding it lowers the Brier
+ * score on both tests. The last rung is the board's odds model itself.
+ */
+export function oddsLadder(protocols: SnapshotProtocol[], asOf: string): LadderStep[] {
+  const catsBig = bigCategories(valueFitRows(protocols));
+  const medAge = medianAgeDays(protocols, asOf);
+  const y = protocols.map((p) => (p.gecko_id !== null || p.symbol !== null ? 1 : 0));
+  const ageTerm = (p: SnapshotProtocol): number[] => {
+    const age = ageDaysApprox(asOf, p.listed_at) ?? medAge;
+    return [Math.log10(Math.max(age, 1) / 365.25)];
+  };
+  const termSets: { label: string; extra: (p: SnapshotProtocol) => number[] }[] = [
+    { label: '+ age, years listed', extra: ageTerm },
+    { label: '+ size, log TVL', extra: (p) => [Math.log10(p.tvl_usd)] },
+    { label: '+ 7-day growth, winsorized', extra: (p) => [growthFraction(p.change_7d)] },
+    { label: '+ category', extra: (p) => catsBig.slice(1).map((c) => (p.category === c ? 1 : 0)) },
+  ];
+  const datedIdx = protocols
+    .map((p, i) => ({ i, age: ageDaysApprox(asOf, p.listed_at) }))
+    .filter((d): d is { i: number; age: number } => d.age !== null)
+    .sort((a, b) => b.age - a.age)
+    .map((d) => d.i);
+  const wfCut = Math.floor(datedIdx.length * 0.6);
+  const wfTrain = datedIdx.slice(0, wfCut);
+  const wfTest = datedIdx.slice(wfCut);
+  const score = (feats: (p: SnapshotProtocol) => number[]): LadderStep => {
+    const X = protocols.map(feats);
+    let cvBrier = 0;
+    let cvAcc = 0;
+    for (let f = 0; f < 10; f++) {
+      const test = protocols.map((_, i) => i).filter((i) => i % 10 === f);
+      const train = protocols.map((_, i) => i).filter((i) => i % 10 !== f);
+      const b = fitLogistic(
+        train.map((i) => X[i]!),
+        train.map((i) => y[i]!),
+      );
+      for (const i of test) {
+        const pr = sigmoid(dot(b, X[i]!));
+        cvBrier += (pr - y[i]!) ** 2 / protocols.length;
+        if ((pr >= 0.5) === (y[i] === 1)) cvAcc += 1 / protocols.length;
+      }
+    }
+    const bWf = fitLogistic(
+      wfTrain.map((i) => X[i]!),
+      wfTrain.map((i) => y[i]!),
+    );
+    let wfBrier = 0;
+    let wfAcc = 0;
+    for (const i of wfTest) {
+      const pr = sigmoid(dot(bWf, X[i]!));
+      wfBrier += (pr - y[i]!) ** 2 / wfTest.length;
+      if ((pr >= 0.5) === (y[i] === 1)) wfAcc += 1 / wfTest.length;
+    }
+    return { label: '', test_a: cvBrier, test_b: wfBrier, acc_a: cvAcc, acc_b: wfAcc, kept: null };
+  };
+  const steps: LadderStep[] = [];
+  let feats: (p: SnapshotProtocol) => number[] = () => [1];
+  const base = score(feats);
+  steps.push({ ...base, label: 'base rate of peers' });
+  let prev = base;
+  for (const term of termSets) {
+    const grown = feats;
+    feats = (p) => [...grown(p), ...term.extra(p)];
+    const s = score(feats);
+    steps.push({ ...s, label: term.label, kept: s.test_a < prev.test_a && s.test_b < prev.test_b });
+    prev = s;
+  }
+  return steps;
 }
 
 /** A protocol's conditional value: what its token would be worth if it launched, under the value fit. */
@@ -509,21 +714,41 @@ export function archetypeFor(category: string | null): Archetype {
   return base;
 }
 
-/** The farm model's stated assumptions, printed on the page beside the verdicts. */
-export const FARM_DEFAULTS = { drop_share: 0.1, weeks: 16, opp_rate: 0.05 };
-
-export interface FarmParams {
+/**
+ * The farm scenario: ONE set of assumptions for every row, printed on the
+ * page beside the verdicts. The plan is sized to the protocol — 0.02% of
+ * its TVL, floored at $250 and capped at $10,000, so one wallet works the
+ * whole board at the same rule. The drop is 7% of a launch's implied value,
+ * shared pro-rata across TVL. Verdicts are net of the plan's gas; what the
+ * same deposit would earn risk-free over the season is computed and printed
+ * in each row's detail, not netted — at any plan size a 5%/yr charge on the
+ * deposit exceeds the giants' pool intensity (about 0.15–0.24% of TVL), so
+ * netting it would mark every large protocol SKIP for a reason that has
+ * nothing to do with its farm.
+ */
+export interface Scenario {
+  plan_pct: number;
+  plan_floor: number;
+  plan_cap: number;
   drop_share: number;
   weeks: number;
   opp_rate: number;
-  capital: number;
 }
 
-/** One row's farm economics under stated assumptions. */
+/** The canonical scenario the board and its plans are computed under. */
+export const SCENARIO: Scenario = { plan_pct: 0.0002, plan_floor: 250, plan_cap: 10_000, drop_share: 0.07, weeks: 12, opp_rate: 0.05 };
+
+/** The scenario's deposit for one protocol: its plan size, floored and capped. */
+export function scenarioDeposit(tvl: number, scen: Scenario): number {
+  return Math.min(Math.max(scen.plan_pct * tvl, scen.plan_floor), scen.plan_cap);
+}
+
+/** One row's farm economics under the scenario. */
 export interface FarmEcon {
+  deposit: number;
   pool: number;
   intensity: number;
-  gross: number;
+  drop: number;
   gas_cost: number;
   opp_cost: number;
   hours: number;
@@ -532,18 +757,19 @@ export interface FarmEcon {
   verdict: 'FARM' | 'MARGINAL' | 'SKIP';
 }
 
-/** The verdict arithmetic of MODEL §6, in one place so the page and the plan agree. */
-export function farmEconomics(condValue: number, tvl: number, arch: Archetype, gasPerTxUsd: number, params: FarmParams): FarmEcon {
-  const pool = condValue * params.drop_share;
+/** The scenario arithmetic, in one place so the page, the plan and the board agree. */
+export function farmEconomics(implied: number, tvl: number, arch: Archetype, gasPerTxUsd: number, scen: Scenario): FarmEcon {
+  const deposit = scenarioDeposit(tvl, scen);
+  const pool = scen.drop_share * implied;
   const intensity = pool / tvl;
-  const gross = intensity * params.capital;
+  const drop = intensity * deposit;
   const gas_cost = arch.txs * gasPerTxUsd;
-  const opp_cost = params.capital * params.opp_rate * (params.weeks / 52);
-  const hours = (arch.setup_min + arch.upkeep_min * params.weeks) / 60;
-  const net = gross - gas_cost - opp_cost;
+  const opp_cost = deposit * scen.opp_rate * (scen.weeks / 52);
+  const hours = (arch.setup_min + arch.upkeep_min * scen.weeks) / 60;
+  const net = drop - gas_cost;
   const per_hour = hours > 0 ? net / hours : 0;
   const verdict = arch.no_retail || per_hour < 5 ? 'SKIP' : per_hour >= 25 ? 'FARM' : 'MARGINAL';
-  return { pool, intensity, gross, gas_cost, opp_cost, hours, net, per_hour, verdict };
+  return { deposit, pool, intensity, drop, gas_cost, opp_cost, hours, net, per_hour, verdict };
 }
 
 // ------------------------------------------------------------ number formats
@@ -568,39 +794,45 @@ export function usdHour(n: number): string {
   return n < 0 ? `-$${v}` : `$${v}`;
 }
 
+/** A fee-sized amount with its cents kept — gas is small and "$0" would lie: "$0.12", "$5", "$64". */
+export function usdFee(n: number): string {
+  if (Math.abs(n) >= 1000) return usd(n);
+  return `$${String(Math.round(n * 100) / 100)}`;
+}
+
 // --------------------------------------------------------------- farm steps
 
-/** A protocol's farm plan: six steps, each the archetype instantiated with the row's own numbers. */
-export function farmSteps(p: SnapshotProtocol, arch: Archetype, gas: { chain: string; gas: number }, econ: FarmEcon, params: FarmParams): string[] {
+/** A protocol's farm plan: six steps, each the archetype instantiated with the row's own scenario numbers. */
+export function farmSteps(p: SnapshotProtocol, arch: Archetype, gas: { chain: string; gas: number }, econ: FarmEcon, scen: Scenario): string[] {
   const chain = gas.chain;
-  const weeks = params.weeks;
+  const weeks = scen.weeks;
   const steps: string[] = [];
   steps.push(
-    `Open a fresh wallet for this farm and fund it on ${chain}, the cheapest chain ${p.name} runs on at about ${usd(gas.gas)} a transaction. Cost: about ${usd(gas.gas * 2)} for the funding transactions. Time: 10 minutes, once, and keep the seed phrase offline.`,
+    `Open a fresh wallet for this farm and fund it on ${chain}, the cheapest chain ${p.name} runs on at about ${usdFee(gas.gas)} a transaction. Cost: about ${usdFee(gas.gas * 2)} for the funding transactions. Time: 10 minutes, once, and keep the seed phrase offline.`,
   );
   if (arch.no_retail) {
     steps.push(
-      `${arch.action(p.name, chain)} There is no position to open and nothing to stake, so the honest plan is not to farm it: the verdict is SKIP at any capital, and the steps below are the monitoring routine only.`,
+      `${arch.action(p.name, chain)} There is no position to open and nothing to stake, so the honest plan is not to farm it: the verdict is SKIP at any plan size, and the steps below are the monitoring routine only.`,
     );
   } else {
     steps.push(
-      `${arch.action(p.name, chain)} Cost: ${usd(params.capital)} of capital plus about ${usd(econ.gas_cost)} of gas across roughly ${arch.txs} transactions for the season. Time: ${arch.setup_min} minutes to set up.${arch.note !== null ? ` Note: ${arch.note}` : ''}`,
+      `${arch.action(p.name, chain)} The plan for this row is ${usd(econ.deposit)} — the scenario's size for a protocol of this TVL (0.02% of TVL, capped at $10,000) — plus about ${usdFee(econ.gas_cost)} of gas across roughly ${arch.txs} transactions for the season. Time: ${arch.setup_min} minutes to set up.${arch.note !== null ? ` Note: ${arch.note}` : ''}`,
     );
   }
   steps.push(
-    `Stay a user for the ${weeks}-week season: ${arch.upkeep}, about ${arch.upkeep_min} minutes a week (${arch.setup_min + arch.upkeep_min * weeks} minutes of your time in all). One deposit and silence reads as a bot farm; a season of ordinary use is the position.`,
+    `Stay a user for the ${weeks}-week season: ${arch.upkeep}, about ${arch.upkeep_min} minutes a week (${arch.setup_min + arch.upkeep_min * weeks} minutes of your time in all, ${econ.hours.toFixed(1)} hours). One deposit and silence reads as a bot farm; a season of ordinary use is the position.`,
   );
   steps.push(
     arch.no_retail
-      ? `The arithmetic, on paper only: a launch worth ${usd(econ.pool / params.drop_share)} with ${Math.round(params.drop_share * 100)}% to farmers is a ${usd(econ.pool)} pool over ${usd(p.tvl_usd)} of TVL, ${rate(econ.intensity)} per $1 in — but with no deposit, pool or staking surface, no retail position can take a share of it, which is why the verdict stays SKIP.`
-      : `The arithmetic, at the stated assumptions: a launch worth ${usd(econ.pool / params.drop_share)} with ${Math.round(params.drop_share * 100)}% to farmers is a ${usd(econ.pool)} pool over ${usd(p.tvl_usd)} of TVL, ${rate(econ.intensity)} per $1 in. A ${usd(params.capital)} position expects about ${usd(econ.gross)} before costs and ${usd(econ.net)} after gas and the 5%/yr cost of locked capital: ${usdHour(econ.per_hour)} an hour, a ${econ.verdict}.`,
+      ? `The arithmetic, on paper only: the scenario's drop is ${Math.round(scen.drop_share * 100)}% of a launch's implied value — here a pool of ${usd(econ.pool)} over ${usd(p.tvl_usd)} of TVL, ${rate(econ.intensity)} per $1 in — but with no deposit, pool or staking surface, no retail position can take a share of it, which is why the verdict stays SKIP.`
+      : `The arithmetic, under the printed scenario: the drop is ${Math.round(scen.drop_share * 100)}% of the launch's implied value, a pool of ${usd(econ.pool)} over ${usd(p.tvl_usd)} of TVL — ${rate(econ.intensity)} per $1 deposited. This row's ${usd(econ.deposit)} plan expects ${usd(econ.drop)} of it, less ${usdFee(econ.gas_cost)} of gas: ${usd(econ.net)} for ${econ.hours.toFixed(1)} hours of work, ${usdHour(econ.per_hour)} an hour — a ${econ.verdict}.`,
   );
-  const growth = p.change_7d === null ? 'unreported in the snapshot' : `${p.change_7d > 0 ? '+' : ''}${p.change_7d}% over the snapshot's last 7 days`;
+  const growth = p.change_7d === null ? 'unreported in the snapshot' : `${p.change_7d > 0 ? '+' : ''}${p.change_7d.toFixed(2)}% over the snapshot's last 7 days`;
   steps.push(
     `Monitor weekly: ${p.name}'s TVL trend (${growth}), its own announcements, and any points or rewards page it opens. If it launches, claim only from the link the protocol itself publishes — a claim never costs a fee, and a page asking for one is a phish.`,
   );
   steps.push(
-    `Exit with discipline: if no token or points program has appeared by the end of the ${weeks}-week season, unwind in one session (about ${usd(gas.gas * 3)} of gas, 15 minutes) and write the wallet, the dates and every transaction into a farm log, so the next season starts from a record, not a memory.`,
+    `Exit with discipline: if no token or points program has appeared by the end of the ${weeks}-week season, unwind in one session (about ${usdFee(gas.gas * 3)} of gas, 15 minutes) and write the wallet, the dates and every transaction into a farm log, so the next season starts from a record, not a memory.`,
   );
   return steps.map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s));
 }
@@ -634,8 +866,16 @@ export interface RadarRow extends BoardRow {
   age_imputed: boolean;
   gas_chain: string;
   gas_per_tx: number;
-  arch: { txs: number; setup_min: number; upkeep_min: number; capital: number };
-  econ: { pool: number; intensity: number; gross: number; gas_cost: number; opp_cost: number; hours: number; net: number; per_hour: number };
+  arch: { txs: number; setup_min: number; upkeep_min: number; no_retail: boolean };
+  econ: { deposit: number; pool: number; intensity: number; drop: number; gas_cost: number; opp_cost: number; hours: number; net: number; per_hour: number };
+  /** The conditional value's printed range, from the fit's leave-one-out residual quantiles. */
+  c10: number;
+  c25: number;
+  c75: number;
+  c90: number;
+  /** Where this row ranks across 200 bootstrap refits of the value fit (middle 90%), odds held. */
+  rank_lo: number;
+  rank_hi: number;
 }
 
 /** Everything the dashboard renders: the board, the model, the accounting, the launched set. */
@@ -643,7 +883,26 @@ export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  counts: { total: number; launched: number; pretoken: number; excluded: number; ranked: number; fit_sample: number; watchlist: number; watchlist_covered: number };
+  counts: {
+    total: number;
+    launched: number;
+    launched_priced: number;
+    launched_unpriced: number;
+    pretoken: number;
+    excluded: number;
+    excl_bridge: number;
+    excl_staking: number;
+    excl_exchange: number;
+    excl_named: number;
+    ranked: number;
+    ranked_watchlist: number;
+    ranked_above_floor: number;
+    ranked_below_floor: number;
+    fit_sample: number;
+    watchlist: number;
+    watchlist_covered: number;
+    verdicts: { FARM: number; MARGINAL: number; SKIP: number };
+  };
   reason_counts: Record<ExclusionReason, number>;
   model: {
     value: { intercept: number; slope: number; n: number; band_factor: number; resid_q25: number; resid_q75: number };
@@ -658,11 +917,14 @@ export interface RadarData {
       within3_baseline: number;
       walk_forward: WalkForward[];
     };
-    odds: { brier_cv: number; brier_in: number; brier_base: number; base_rate: number; beta_const: number; beta_tvl: number; beta_age: number; beta_growth: number };
+    odds: { brier_cv: number; brier_in: number; brier_base: number; base_rate: number; beta_const: number; beta_tvl: number; beta_age: number; beta_growth: number; beta_cats: { name: string; beta: number }[] };
+    ladders: { value: LadderStep[]; odds: LadderStep[] };
+    honesty: { loo: RangeHonesty; wf: RangeHonesty };
   };
   rows: RadarRow[];
   live: { slug: string; name: string; category: string | null; tvl_usd: number; mcap_usd: number | null; change_7d: number | null }[];
-  defaults: { drop_share: number; weeks: number; opp_rate: number };
+  scenario: Scenario;
+  seal: { checksum: string; total_implied: number; total_tvl: number };
   issues: string[];
 }
 
@@ -671,21 +933,76 @@ const round = (x: number, dp: number): number => {
   return Math.round(x * f) / f;
 };
 
+/** A tiny deterministic generator (mulberry32): the bootstrap must never depend on chance. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Rank ranges from 200 bootstrap refits of the value fit, the launch odds
+ * held at the fit: each refit resamples the traded tokens with replacement,
+ * refits the line, and re-ranks the board. A row's range is the middle 90%
+ * of the ranks it takes — how much of its place is the fit's doing.
+ */
+export function bootstrapRankRanges(protocols: SnapshotProtocol[], board: { tvl: number; odds: number }[]): { lo: number; hi: number }[] {
+  const fitRows = valueFitRows(protocols);
+  const rand = mulberry32(0x5eed);
+  const ranks: number[][] = board.map(() => []);
+  for (let r = 0; r < 200; r++) {
+    const sample = fitRows.map(() => fitRows[Math.floor(rand() * fitRows.length)]!);
+    const beta = ols(
+      sample.map((p) => [1, Math.log10(p.tvl_usd)]),
+      sample.map((p) => Math.log10(p.mcap_usd!)),
+    );
+    const imp = board.map((b) => Math.pow(10, beta[0]! + beta[1]! * Math.log10(b.tvl)) * b.odds);
+    for (let i = 0; i < board.length; i++) {
+      let rank = 1;
+      for (let j = 0; j < board.length; j++) if (imp[j]! > imp[i]! || (imp[j] === imp[i] && j < i)) rank++;
+      ranks[i]!.push(rank);
+    }
+  }
+  return ranks.map((list) => {
+    const s = [...list].sort((a, b) => a - b);
+    return { lo: s[Math.floor(0.05 * s.length)]!, hi: s[Math.min(s.length - 1, Math.floor(0.95 * s.length))]! };
+  });
+}
+
+/** The one exclusion group a set-aside protocol is counted under, by priority: the bar must partition the 141. */
+function exclusionGroup(p: SnapshotProtocol, why: ExclusionReason[]): 'bridge' | 'staking' | 'exchange' | 'named' {
+  if (p.category === 'Bridge' || p.category === 'Canonical Bridge') return 'bridge';
+  if (p.category === 'Liquid Staking' || p.category === 'Liquid Restaking' || p.category === 'Restaked BTC') return 'staking';
+  if (p.category === 'CEX' || why.includes('exchange-name')) return 'exchange';
+  return 'named';
+}
+
 /** Fit the models, apply the exclusions, rank the genuine pre-token protocols, and assemble everything. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: RadarData } {
   const valueFit = fitValueModel(snapshot.protocols, snapshot.as_of);
   const oddsFit = fitOddsModel(snapshot.protocols, snapshot.as_of);
+  const ladders = { value: valueLadder(snapshot.protocols, snapshot.as_of), odds: oddsLadder(snapshot.protocols, snapshot.as_of) };
+  const honesty = rangeHonesty(snapshot.protocols, snapshot.as_of);
   const watch = new Set(snapshot.watchlist);
   const launched: SnapshotProtocol[] = [];
   const pretoken: SnapshotProtocol[] = [];
   for (const p of snapshot.protocols) (recordsNoToken(p) ? pretoken : launched).push(p);
 
   const reason_counts: Record<ExclusionReason, number> = { category: 0, 'version-name': 0, 'wrapped-word': 0, 'exchange-name': 0 };
+  const groups = { bridge: 0, staking: 0, exchange: 0, named: 0 };
   const genuine: SnapshotProtocol[] = [];
   for (const p of pretoken) {
     const why = exclusionReasons(p);
     if (why.length === 0) genuine.push(p);
-    else for (const w of why) reason_counts[w]++;
+    else {
+      for (const w of why) reason_counts[w]++;
+      groups[exclusionGroup(p, why)]++;
+    }
   }
 
   const scored = genuine.map((p) => {
@@ -694,15 +1011,26 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: Radar
     const implied = Math.max(1, Math.round(cond * odds));
     const arch = archetypeFor(p.category);
     const gas = cheapestChain(p);
-    const params: FarmParams = { ...FARM_DEFAULTS, capital: arch.capital };
-    const econ = farmEconomics(cond, p.tvl_usd, arch, gas.gas, params);
-    return { p, cond, odds, implied, arch, gas, econ, steps: farmSteps(p, arch, gas, econ, params) };
+    const econ = farmEconomics(implied, p.tvl_usd, arch, gas.gas, SCENARIO);
+    const logCond = Math.log10(cond);
+    const range = (qLo: number, qHi: number) => ({ lo: Math.round(Math.pow(10, logCond + qLo)), hi: Math.round(Math.pow(10, logCond + qHi)) });
+    const p2575 = range(valueFit.resid_q25, valueFit.resid_q75);
+    const p1090 = range(valueFit.resid_q10, valueFit.resid_q90);
+    return { p, cond, odds, implied, arch, gas, econ, steps: farmSteps(p, arch, gas, econ, SCENARIO), p2575, p1090 };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
 
+  // Rank ranges: 200 bootstrap refits of the value fit (a fixed-seed
+  // generator, so the board is byte-identical on every run), the launch
+  // odds held at the fit. A row's range is the middle 90% of the ranks it
+  // takes across the refits — how much of its place is the fit's doing.
+  const rankRange = bootstrapRankRanges(snapshot.protocols, scored.map((s) => ({ tvl: s.p.tvl_usd, odds: s.odds })));
+
   const board: BoardRow[] = [];
   const rows: RadarRow[] = [];
+  const verdicts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
   scored.forEach((s, i) => {
+    verdicts[s.econ.verdict]++;
     const row: BoardRow = {
       rank: i + 1,
       slug: s.p.slug,
@@ -729,17 +1057,24 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: Radar
       age_imputed: s.p.listed_at === null,
       gas_chain: s.gas.chain,
       gas_per_tx: s.gas.gas,
-      arch: { txs: s.arch.txs, setup_min: s.arch.setup_min, upkeep_min: s.arch.upkeep_min, capital: s.arch.capital },
+      arch: { txs: s.arch.txs, setup_min: s.arch.setup_min, upkeep_min: s.arch.upkeep_min, no_retail: s.arch.no_retail },
       econ: {
+        deposit: Math.round(s.econ.deposit),
         pool: Math.round(s.econ.pool),
         intensity: s.econ.intensity,
-        gross: Math.round(s.econ.gross),
+        drop: Math.round(s.econ.drop),
         gas_cost: Math.round(s.econ.gas_cost * 100) / 100,
-        opp_cost: Math.round(s.econ.opp_cost * 100) / 100,
+        opp_cost: Math.round(s.econ.opp_cost),
         hours: round(s.econ.hours, 1),
         net: Math.round(s.econ.net),
         per_hour: round(s.econ.per_hour, 2),
       },
+      c10: s.p1090.lo,
+      c25: s.p2575.lo,
+      c75: s.p2575.hi,
+      c90: s.p1090.hi,
+      rank_lo: rankRange[i]!.lo,
+      rank_hi: rankRange[i]!.hi,
     });
   });
 
@@ -748,6 +1083,13 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: Radar
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0))
     .slice(0, 24);
 
+  const roundStep = (s: LadderStep): LadderStep => ({
+    label: s.label,
+    test_a: round(s.test_a, 4),
+    test_b: round(s.test_b, 4),
+    ...(s.acc_a !== undefined ? { acc_a: round(s.acc_a, 3), acc_b: round(s.acc_b!, 3) } : {}),
+    kept: s.kept,
+  });
   const data: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -755,12 +1097,22 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: Radar
     counts: {
       total: snapshot.protocols.length,
       launched: launched.length,
+      launched_priced: launched.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0).length,
+      launched_unpriced: launched.filter((p) => !(p.mcap_usd !== null && p.mcap_usd > 0)).length,
       pretoken: pretoken.length,
       excluded: pretoken.length - genuine.length,
+      excl_bridge: groups.bridge,
+      excl_staking: groups.staking,
+      excl_exchange: groups.exchange,
+      excl_named: groups.named,
       ranked: board.length,
+      ranked_watchlist: board.filter((r) => r.watchlist).length,
+      ranked_above_floor: board.filter((r) => !r.watchlist && r.tvl_usd >= snapshot.floor_usd).length,
+      ranked_below_floor: board.filter((r) => !r.watchlist && r.tvl_usd < snapshot.floor_usd).length,
       fit_sample: valueFit.n,
       watchlist: snapshot.watchlist.length,
       watchlist_covered: board.filter((r) => r.watchlist).length,
+      verdicts,
     },
     reason_counts,
     model: {
@@ -785,11 +1137,22 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; data: Radar
         beta_tvl: round(oddsFit.beta[1]!, 3),
         beta_age: round(oddsFit.beta[2]!, 3),
         beta_growth: round(oddsFit.beta[3]!, 3),
+        beta_cats: oddsFit.cats_big.slice(1).map((name, k) => ({ name, beta: round(oddsFit.beta[4 + k]!, 3) })),
+      },
+      ladders: { value: ladders.value.map(roundStep), odds: ladders.odds.map(roundStep) },
+      honesty: {
+        loo: { within3: round(honesty.loo.within3, 3), in_p25_75: round(honesty.loo.in_p25_75, 3), in_p10_90: round(honesty.loo.in_p10_90, 3) },
+        wf: { within3: round(honesty.wf.within3, 3), in_p25_75: round(honesty.wf.in_p25_75, 3), in_p10_90: round(honesty.wf.in_p10_90, 3) },
       },
     },
     rows,
     live,
-    defaults: { ...FARM_DEFAULTS },
+    scenario: { ...SCENARIO },
+    seal: {
+      checksum: boardChecksum(board),
+      total_implied: board.reduce((s, r) => s + r.implied_value_usd, 0),
+      total_tvl: board.reduce((s, r) => s + r.tvl_usd, 0),
+    },
     issues: [],
   };
   data.issues = boardIssue(board, snapshot);
@@ -822,6 +1185,16 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string[] {
   if (board.length > 1 && allEqual) issues.push('every implied value on the board is the same');
   for (const slug of snapshot.watchlist) if (!board.some((r) => r.slug === slug)) issues.push(`watchlist protocol ${slug} is missing from the board`);
   return issues;
+}
+
+/** The board's canonical serialization: the exact bytes board.json carries. */
+export function boardJson(board: BoardRow[]): string {
+  return `${JSON.stringify(board, null, 1)}\n`;
+}
+
+/** A short checksum of board.json's bytes, printed on the page as its seal. */
+export function boardChecksum(board: BoardRow[]): string {
+  return createHash('sha256').update(boardJson(board), 'utf8').digest('hex').slice(0, 8);
 }
 
 /** The dashboard's data file: the whole radar as one assignment. */

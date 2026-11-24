@@ -12,7 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier, DossierError } from './vendor/makefun-board.ts';
-import { buildRadar, dataScript, parseSnapshot, SnapshotError } from './lib/model.ts';
+import { boardJson, buildRadar, dataScript, parseSnapshot, SnapshotError } from './lib/model.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DOSSIER_TEXT_MAX = 65_536;
@@ -52,7 +52,7 @@ function main(): number {
     }
     const out = process.env.MAKEFUN_OUTPUT_DIR ?? 'out';
     mkdirSync(out, { recursive: true });
-    writeFileSync(join(out, 'board.json'), `${JSON.stringify(board, null, 1)}\n`);
+    writeFileSync(join(out, 'board.json'), boardJson(board));
     writeFileSync(join(out, 'data.js'), dataScript(data));
     copyTree(join(HERE, 'dashboard'), join(out, 'dashboard'));
     copyTree(join(HERE, 'screenshots'), join(out, 'screenshots'));
@@ -77,8 +77,8 @@ function main(): number {
     console.log(`accounting: ${c.launched} launched set aside, ${c.pretoken} record no token, ${c.excluded} excluded as products of launched tokens, ${c.ranked} ranked`);
     console.log(`watchlist: ${c.watchlist_covered}/${c.watchlist} on the board`);
     console.log(`value fit: log10(mcap) = ${data.model.value.intercept} + ${data.model.value.slope} * log10(TVL) on ${data.model.value.n} traded tokens; leave-one-out miss ${data.model.validation.loo_model} dex against the flat multiple's ${data.model.validation.loo_baseline}`);
-    console.log(`odds fit: cross-validated Brier ${data.model.odds.brier_cv} against a base-rate ${data.model.odds.brier_base}`);
-    console.log(`board: ${board.length} rows, top ${board[0]!.slug} at ${board[0]!.implied_value_usd}`);
+    console.log(`odds fit: ten-fold cross-validated Brier ${data.model.odds.brier_cv} against a base-rate ${data.model.odds.brier_base}`);
+    console.log(`board: ${board.length} rows, top ${board[0]!.slug} at ${board[0]!.implied_value_usd}; seal ${data.seal.checksum}, total implied ${data.seal.total_implied}`);
     console.log(`dossier: ${dossier.byteLength} bytes`);
     return 0;
   } catch (error) {
