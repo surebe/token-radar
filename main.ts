@@ -4,6 +4,8 @@
 // ranks the genuine pre-token protocols, and writes the handover the judge
 // reads: board.json, the dashboard with its data file, the screenshots, and
 // dossier.json, the canonical summary built last by the kit's own library.
+// It also writes the refit records into the dashboard itself, so the page
+// can re-run the fits in the browser and check its board against this one.
 //
 // Node's standard library only, no network, deterministic: the same snapshot
 // in, the same bytes out, on every run.
@@ -12,7 +14,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier, DossierError } from './vendor/makefun-board.ts';
-import { boardJson, buildRadar, dataScript, parseSnapshot, SnapshotError } from './lib/model.ts';
+import { boardJson, buildRadar, dataScript, fitScript, parseSnapshot, SnapshotError } from './lib/model.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DOSSIER_TEXT_MAX = 65_536;
@@ -45,7 +47,7 @@ function copyTree(from: string, to: string): void {
 function main(): number {
   try {
     const snapshot = parseSnapshot(readFileSync(snapshotPath(process.argv.slice(2)), 'utf8'));
-    const { board, data } = buildRadar(snapshot);
+    const { board, data, fit } = buildRadar(snapshot);
     if (data.issues.length > 0) {
       for (const issue of data.issues) console.error(`board: ${issue}`);
       return 1;
@@ -55,6 +57,9 @@ function main(): number {
     writeFileSync(join(out, 'board.json'), boardJson(board));
     writeFileSync(join(out, 'data.js'), dataScript(data));
     copyTree(join(HERE, 'dashboard'), join(out, 'dashboard'));
+    // The refit records belong inside the dashboard: the page's own fit
+    // runs on them, and the dossier that reaches the judge carries them.
+    writeFileSync(join(out, 'dashboard', 'fit-data.js'), fitScript(fit));
     copyTree(join(HERE, 'screenshots'), join(out, 'screenshots'));
     // The dossier goes last: it summarizes the output directory as it stands.
     let dossier: Uint8Array;
@@ -73,11 +78,12 @@ function main(): number {
       return 1;
     }
     const c = data.counts;
+    const v = data.model.validation;
     console.log(`snapshot: ${c.total} protocols as of ${data.as_of} (${data.source}, floor ${data.floor_usd})`);
     console.log(`accounting: ${c.launched} launched set aside, ${c.pretoken} record no token, ${c.excluded} excluded as products of launched tokens, ${c.ranked} ranked`);
     console.log(`watchlist: ${c.watchlist_covered}/${c.watchlist} on the board`);
-    console.log(`value fit: log10(mcap) = ${data.model.value.intercept} + ${data.model.value.slope} * log10(TVL) on ${data.model.value.n} traded tokens; leave-one-out miss ${data.model.validation.loo_model} dex against the flat multiple's ${data.model.validation.loo_baseline}`);
-    console.log(`odds fit: ten-fold cross-validated Brier ${data.model.odds.brier_cv} against a base-rate ${data.model.odds.brier_base}`);
+    console.log(`value fit: log10(mcap) = ${data.model.value.intercept} + ${data.model.value.slope} * log10(TVL) with shrunk category offsets, on ${c.fit_sample} cleaned caps of ${c.fit_raw} usable (${c.fit_dropped} set aside by the cleaning pass); leave-one-out miss ${v.loo_model} dex against the flat multiple's ${v.loo_baseline}`);
+    console.log(`odds fit: the peers' launch curve, blended by category; cross-validated Brier ${data.model.odds.brier_cv} and walk-forward ${data.model.odds.brier_wf} against a base-rate ${data.model.odds.brier_base} and the logistic's ${data.model.odds.logistic_cv} / ${data.model.odds.logistic_wf}`);
     console.log(`board: ${board.length} rows, top ${board[0]!.slug} at ${board[0]!.implied_value_usd}; seal ${data.seal.checksum}, total implied ${data.seal.total_implied}`);
     console.log(`dossier: ${dossier.byteLength} bytes`);
     return 0;

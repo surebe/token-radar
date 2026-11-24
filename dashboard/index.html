@@ -10,7 +10,7 @@
 <header class="top">
   <div class="brand">
     <h1>Token Launch Radar</h1>
-    <p class="formula-line">Implied value = <b>value if it launches</b> (a log-log line fitted on this snapshot's traded tokens) × <b>launch odds</b> (a logistic fit on all of them). Every coefficient below is fitted on this snapshot and tested held-out; the farm verdicts are one stated scenario's arithmetic, not promises.</p>
+    <p class="formula-line">Implied value = <b>value if it launches</b> (a log-log line with shrunk category offsets, fitted on this snapshot's traded tokens after a cleaning pass) × <b>launch odds</b> (the peers' own launch curve, read by category). Every coefficient below is fitted on this snapshot and tested held-out — and refitted in this browser, from the records shipped with this page, before the board is drawn. The farm verdicts are one stated scenario's arithmetic, not promises.</p>
   </div>
   <div class="meta" id="meta"></div>
 </header>
@@ -28,6 +28,7 @@
   <label>Horizon, weeks <input id="weeks" type="number" min="1" max="52" step="1"></label>
   <label>Search <input id="q" type="search" placeholder="name or slug"></label>
   <label>Category <select id="cat"><option value="">All categories</option></select></label>
+  <label>Chain <select id="chain"><option value="">All chains</option></select></label>
   <label>Sort
     <select id="sort">
       <option value="rank">Implied value (rank)</option>
@@ -38,6 +39,7 @@
       <option value="name">Name</option>
     </select>
   </label>
+  <button type="button" id="export">Export CSV</button>
   <button type="button" id="reset">Reset</button>
 </div>
 <p class="count" id="rowcount"></p>
@@ -51,19 +53,19 @@
     <tbody></tbody>
   </table>
 </div>
-<p class="hint">Range: where the row ranks across 200 bootstrap refits of the value fit (middle 90%), launch odds held at the fit. The implied range under each value is its P25–P75 from the fit's own leave-one-out residuals. Select a row for its detail: the model's working, the scenario economics, and its farm plan. Verdicts recompute live at your plan size, drop share and horizon; each detail's printed plan is the canonical one from board.json at the stated scenario (plan 0.02% of TVL, $250–$10,000 · drop 7% of implied · 12 weeks).</p>
+<p class="hint">Range: where the row ranks across 200 bootstrap refits of the value fit (middle 90%), launch odds held at the fit. The implied range under each value is its P25–P75 from the fit's own leave-one-out residuals. Select a row for its detail: the model's equation for that protocol, its nearest priced peers, the verdict's break-evens, and its farm plan. Verdicts recompute live at your plan size, drop share and horizon; each detail's printed plan is the canonical one from board.json at the stated scenario (plan 0.02% of TVL, $250–$10,000 · drop 7% of implied · 12 weeks · fees include a flat $1.00 withdrawal).</p>
 <div id="reading-slot"></div>
 
 <section id="view-detail" hidden></section>
 
 <section class="smallprint">
   <h3>How to read this page, and what the data cannot say</h3>
-  <p>The odds are a prevalence fit, not a prophecy: the fit learns how often protocols with these figures already record a token, which mixes "will launch" with "already did" — the snapshot holds no launch dates, so no rung of the ladder is a timing claim. "Records no token" is made precise as both token fields (CoinGecko id and symbol) empty; 258 protocols carry exactly one of the two, so a one-field rule misreads the population in both directions. Listing dates are missing for 113 protocols, two of them on the watchlist; their ages are imputed at the population median and flagged on their rows. The value fit learns from the 128 traded tokens that record a market cap; the other 288 launched protocols record none, so the fit describes protocols that report a cap, not all that trade. Seven-day growth is winsorized to [−50%, +100%] because the raw field runs to +4,448%. The verdicts' one scenario is printed above the board; change it and every verdict on the page moves with it, while board.json keeps the canonical one. Nothing here is financial advice.</p>
+  <p>The odds are the peers' record, not a prophecy: the launch curve learns, from protocols that survived to at least $5M of TVL, what share record a token by each age — the snapshot holds no launch dates, so the curve is a cross-section read as a life table, and a protocol's odds are the share of its cohort's launches still ahead of it. "Records no token" means both token fields (CoinGecko id and symbol) empty; 258 protocols carry exactly one of the two, so a one-field rule misreads the population both ways. The value fit learns from the traded tokens that record a market cap, after a cleaning pass set aside 28 of the 128 usable records whose caps sit more than tenfold from a first-pass line — a parent token's whole cap against one deployment's TVL is the typical case — and the set-aside records are named in the evidence above. Listing dates are missing for 113 protocols, two of them on the watchlist; their ages are imputed at the population median and flagged on their rows. Seven-day growth is winsorized to [−50%, +100%] because the raw field runs to +4,448%. The snapshot carries no parent field, so a name-family is all a family test can use; the test is printed above and no discount is taken from it. The verdicts' one scenario is printed above the board; change it and every verdict moves with it, while board.json keeps the canonical one. Nothing here is financial advice.</p>
 </section>
 
 <section id="view-live">
   <h2>Already launched — set aside, not ranked</h2>
-  <p class="fine">These protocols already record a token, so they are not launch candidates. They are shown for accounting: the value fit is learned from the 128 of them that record a market cap. The largest by market cap:</p>
+  <p class="fine">These protocols already record a token, so they are not launch candidates. They are shown for accounting: the value fit is learned from the 100 of them, after cleaning, that record a usable market cap. The largest by market cap:</p>
   <div class="tablewrap"><table id="livetable">
     <thead><tr><th>Protocol</th><th>Category</th><th class="r">TVL</th><th class="r">Market cap</th><th class="r">7d</th></tr></thead>
     <tbody></tbody>
@@ -71,10 +73,11 @@
 </section>
 
 <footer>
-  <p>Method in one line: implied value = fitted conditional value × fitted launch odds, both fitted on this snapshot by the program that built this page; exclusions are the snapshot's own watchlist rule without its $50M floor. Board seal: <span id="footseal"></span>. Verdicts are arithmetic under the stated scenario, not predictions.</p>
+  <p>Method in one line: implied value = fitted conditional value × cohort launch odds, both fitted on this snapshot — by the program that built this page, and again by this page itself from the shipped records; exclusions are the snapshot's own watchlist rule without its $50M floor. Board seal: <span id="footseal"></span>. Verdicts are arithmetic under the stated scenario, not predictions.</p>
 </footer>
 
 <script src="../data.js"></script>
+<script src="fit-data.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
